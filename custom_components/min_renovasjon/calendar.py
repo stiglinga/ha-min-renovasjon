@@ -20,6 +20,7 @@ class MinRenovasjonCalendar(CoordinatorEntity, CalendarEntity):
         """Initialize Min Renovasjon Calendar."""
         super().__init__(coordinator)
         self._attr_name = "Min Renovasjon Collection"
+        
         # Safe unique_id generation with fallback
         try:
             entry_id = coordinator.config_entry.entry_id
@@ -27,115 +28,119 @@ class MinRenovasjonCalendar(CoordinatorEntity, CalendarEntity):
             entry_id = "min_renovasjon_unknown"
         self._attr_unique_id = f"{entry_id}_calendar"
         
-        # Cache for processed events to avoid redundant processing
-        self._cached_events = []
-        self._cache_timestamp = None
-        self._cache_duration = timedelta(hours=1)
+        # Cache logic is removed/simplified to ensure grouping always works on fresh data
+        # (Coordinator handles the API caching anyway)
 
     @property
     def event(self):
-        """Return the next upcoming event."""
+        """Return the next upcoming event (merged if multiple on same day)."""
         if not self.coordinator.data:
             return None
 
-        # Use cached result if available and still valid
-        if self._cached_events and self._cache_timestamp:
-            if datetime.now() - self._cache_timestamp < self._cache_duration:
-                # Return the earliest event from cached events
-                if self._cached_events:
-                    return min(self._cached_events, key=lambda e: e.start)
-
-        # Find the earliest upcoming collection date from all fractions
+        # 1. Find the absolute earliest date across ALL fractions
         earliest_date = None
+        
         for fraction_data in self.coordinator.data.values():
-            if fraction_data and len(fraction_data) >= 4:
-                next_date = fraction_data[3]  # next_pickup
-                next_next_date = fraction_data[4] if len(fraction_data) >= 5 else None
-
-                # Check both next and next-next dates
-                for potential_date in [next_date, next_next_date]:
-                    if (potential_date is not None and
-                        isinstance(potential_date, datetime) and
-                        (earliest_date is None or potential_date < earliest_date)):
-                        earliest_date = potential_date
+            if not fraction_data or len(fraction_data) < 4:
+                continue
+            
+            # Check next and next-next date
+            next_dates = [d for d in [fraction_data[3], fraction_data[4] if len(fraction_data) >= 5 else None] if d]
+            
+            for date_obj in next_dates:
+                if earliest_date is None or date_obj < earliest_date:
+                    earliest_date = date_obj
 
         if earliest_date is None:
             return None
 
-        # Make datetime timezone-aware for Home Assistant calendar validation
+        # 2. Find ALL fractions that occur on this earliest date (ignoring time)
+        fractions_on_day = []
+        target_date_key = earliest_date.date()
+
+        for fraction_data in self.coordinator.data.values():
+            if not fraction_data or len(fraction_data) < 4:
+                continue
+                
+            fraction_name = fraction_data[1]
+            # Check dates again
+            next_dates = [d for d in [fraction_data[3], fraction_data[4] if len(fraction_data) >= 5 else None] if d]
+            
+            for date_obj in next_dates:
+                if date_obj.date() == target_date_key:
+                    fractions_on_day.append(fraction_name)
+        
+        # Remove duplicates and sort alphabetically for consistent text
+        fractions_on_day = sorted(list(set(fractions_on_day)))
+        combined_summary = " og ".join(fractions_on_day)
+
+        # 3. Create the Event object
         try:
-            start_datetime = datetime.combine(earliest_date.date(), time.min).replace(tzinfo=dt_util.UTC)
-            end_datetime = datetime.combine(earliest_date.date(), time(23, 59)).replace(tzinfo=dt_util.UTC)
+            start_date_obj = target_date_key
+            end_date_obj = start_date_obj + timedelta(days=1)
 
             event = CalendarEvent(
-                summary="Waste Collection",
-                start=start_datetime,
-                end=end_datetime,
+                summary=combined_summary,
+                start=start_date_obj,
+                end=end_date_obj,
+                description=f"Tømming av {combined_summary}",
             )
-            
-            # Cache this result
-            self._cached_events = [event]
-            self._cache_timestamp = datetime.now()
-            
             return event
+
         except (AttributeError, TypeError, ValueError) as e:
-            # Log error and return None if date processing fails
             _LOGGER.warning(f"Error processing calendar event dates: {e}")
             return None
 
     async def async_get_events(self, hass, start_date, end_date):
-        """Return events within a start and end date."""
+        """Return events within a start and end date (Merged by date)."""
         if not self.coordinator.data:
             return []
 
-        # Check if we have cached results and they're still valid
-        if (self._cached_events and self._cache_timestamp and 
-            datetime.now() - self._cache_timestamp < self._cache_duration):
-            # Filter cached events by date range
-            filtered_events = []
-            for event in self._cached_events:
-                if start_date <= event.start <= end_date or start_date <= event.end <= end_date:
-                    filtered_events.append(event)
-            return filtered_events
+        # Dictionary to group fractions by date: { date_obj: ["Restavfall", "Papir"] }
+        grouped_events = {}
 
-        events = []
-        processed_dates = set()  # Track processed dates to avoid duplicates
-        
+        # 1. Collect all events and group them by date
         for fraction_data in self.coordinator.data.values():
-            if not fraction_data or len(fraction_data) < 5:
+            if not fraction_data or len(fraction_data) < 4:
                 continue
 
-            # Get the collection dates (indices 3 and 4 are next_pickup and next_next_pickup)
-            next_pickup = fraction_data[3]
-            next_next_pickup = fraction_data[4]
+            fraction_name = fraction_data[1]
+            
+            # Get next and next-next pickup dates
+            dates_to_check = [fraction_data[3]]
+            if len(fraction_data) >= 5:
+                dates_to_check.append(fraction_data[4])
 
-            dates = [next_pickup, next_next_pickup]
-            for date in dates:
-                if date is None:
+            for date_obj in dates_to_check:
+                if date_obj is None or not isinstance(date_obj, datetime):
                     continue
 
-                # Create date key to avoid duplicate events for same date
-                date_key = date.date()
-                if date_key in processed_dates:
-                    continue
-                processed_dates.add(date_key)
+                # Use date object as key (strips time)
+                date_key = date_obj.date()
+                
+                # Filter by requested range immediately
+                if start_date.date() <= date_key < end_date.date():
+                    if date_key not in grouped_events:
+                        grouped_events[date_key] = []
+                    grouped_events[date_key].append(fraction_name)
 
-                # Make dates timezone-aware for comparison and event creation
-                date_midnight = datetime.combine(date.date(), time.min).replace(tzinfo=dt_util.UTC)
-                date_same_day_end = datetime.combine(date.date(), time(23, 59)).replace(tzinfo=dt_util.UTC)
+        # 2. Create CalendarEvent objects from the grouped data
+        events = []
+        for date_key, fraction_list in grouped_events.items():
+            # Remove duplicates and sort
+            unique_fractions = sorted(list(set(fraction_list)))
+            combined_summary = " og ".join(unique_fractions)
+            
+            event_start = date_key
+            event_end = date_key + timedelta(days=1)
 
-                if start_date <= date_midnight <= end_date or start_date <= date_same_day_end <= end_date:
-                    fraction_name = fraction_data[1] if len(fraction_data) > 1 else "Waste Collection"
-                    events.append(
-                        CalendarEvent(
-                            summary=fraction_name,
-                            start=date_midnight,
-                            end=date_same_day_end,
-                        )
-                    )
-        
-        # Cache the results for future use
-        self._cached_events = events
-        self._cache_timestamp = datetime.now()
+            events.append(
+                CalendarEvent(
+                    summary=combined_summary,
+                    start=event_start,
+                    end=event_end,
+                    description=f"Tømming av {combined_summary}",
+                )
+            )
         
         return events
